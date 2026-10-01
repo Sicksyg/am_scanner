@@ -19,6 +19,10 @@
 #import <mach-o/loader.h>
 #import <mach-o/fat.h>
 #import <libkern/OSByteOrder.h>
+#import <mach/mach_host.h>
+#import <mach/vm_statistics.h>
+#import <sys/resource.h>
+#import <UIKit/UIKit.h>
 
 // mach_vm.h is marked "unsupported" in the iOS SDK; redeclare the syscalls
 // we need. These are available at runtime on every iOS version we target.
@@ -40,6 +44,67 @@ extern kern_return_t mach_vm_region(vm_map_t target_task,
 extern char **environ;
 
 NSString * const TDScannerErrorDomain = @"TDScannerErrorDomain";
+
+#pragma mark - Verbose diagnostics
+
+static BOOL gTDVerbose = NO;
+
+void TDSetVerbose(BOOL verbose) {
+    gTDVerbose = verbose;
+}
+
+static void TDVLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static void TDVLog(NSString *fmt, ...) {
+    if (!gTDVerbose) return;
+    va_list ap; va_start(ap, fmt);
+    NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    fprintf(stderr, "[am_scanner] %s\n", m.UTF8String);
+}
+
+// Logs free/wired page counts and this process's RLIMIT_AS / RLIMIT_DATA so
+// an ENOMEM from posix_spawn can be correlated with actual device memory
+// pressure vs. a per-process resource limit at the moment of failure.
+static void TDVLogMemoryStats(NSString *context) {
+    if (!gTDVerbose) return;
+
+    vm_size_t pageSize = 0;
+    host_page_size(mach_host_self(), &pageSize);
+
+    vm_statistics64_data_t stats;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    kern_return_t kr = host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                                         (host_info64_t)&stats, &count);
+    if (kr == KERN_SUCCESS) {
+        double freeMB = (double)stats.free_count * pageSize / (1024.0 * 1024.0);
+        double wiredMB = (double)stats.wire_count * pageSize / (1024.0 * 1024.0);
+        double activeMB = (double)stats.active_count * pageSize / (1024.0 * 1024.0);
+        double inactiveMB = (double)stats.inactive_count * pageSize / (1024.0 * 1024.0);
+        double compressedMB = (double)stats.compressor_page_count * pageSize / (1024.0 * 1024.0);
+        TDVLog(@"[%@] vm_stat: free=%.1fMB wired=%.1fMB active=%.1fMB inactive=%.1fMB compressed=%.1fMB",
+               context, freeMB, wiredMB, activeMB, inactiveMB, compressedMB);
+    } else {
+        TDVLog(@"[%@] host_statistics64 failed: kr=%d", context, kr);
+    }
+
+    struct rlimit rlAS, rlData, rlNoFile, rlNProc;
+    if (getrlimit(RLIMIT_AS, &rlAS) == 0) {
+        TDVLog(@"[%@] RLIMIT_AS: cur=%llu max=%llu", context,
+               (unsigned long long)rlAS.rlim_cur, (unsigned long long)rlAS.rlim_max);
+    }
+    if (getrlimit(RLIMIT_DATA, &rlData) == 0) {
+        TDVLog(@"[%@] RLIMIT_DATA: cur=%llu max=%llu", context,
+               (unsigned long long)rlData.rlim_cur, (unsigned long long)rlData.rlim_max);
+    }
+    if (getrlimit(RLIMIT_NOFILE, &rlNoFile) == 0) {
+        TDVLog(@"[%@] RLIMIT_NOFILE: cur=%llu max=%llu", context,
+               (unsigned long long)rlNoFile.rlim_cur, (unsigned long long)rlNoFile.rlim_max);
+    }
+    if (getrlimit(RLIMIT_NPROC, &rlNProc) == 0) {
+        TDVLog(@"[%@] RLIMIT_NPROC: cur=%llu max=%llu", context,
+               (unsigned long long)rlNProc.rlim_cur, (unsigned long long)rlNProc.rlim_max);
+    }
+}
 
 static NSError *tderr(TDScannerError code, NSString *fmt, ...) NS_FORMAT_FUNCTION(2, 3);
 static NSError *tderr(TDScannerError code, NSString *fmt, ...) {
@@ -102,8 +167,48 @@ NSArray *TDLoadSignatures(NSString *path, NSError **err) {
 
 #pragma mark - App enumeration
 
-NSArray<NSDictionary *> *TDListInstalledUserApps(void) {
+static NSString *TDImageFormat(NSData *data) {
+    const uint8_t *bytes = data.bytes;
+    NSUInteger length = data.length;
+    if (length >= 8 && memcmp(bytes, "\x89PNG\r\n\x1a\n", 8) == 0) return @"png";
+    if (length >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff) return @"jpeg";
+    if (length >= 6 &&
+        (memcmp(bytes, "GIF87a", 6) == 0 || memcmp(bytes, "GIF89a", 6) == 0)) return @"gif";
+    if (length >= 12 && memcmp(bytes, "RIFF", 4) == 0 && memcmp(bytes + 8, "WEBP", 4) == 0) return @"webp";
+    return nil;
+}
+
+static NSData *TDNormalizeIconData(NSData *data) {
+    if (!data) return nil;
+    if (TDImageFormat(data)) {
+        UIImage *image = [UIImage imageWithData:data];
+        return image ? UIImagePNGRepresentation(image) : nil;
+    }
+
+    typedef CGImageRef (*LICreateIconFromCachedBitmapFn)(NSData *);
+    static LICreateIconFromCachedBitmapFn createIconFromCachedBitmap;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        void *iconServices = dlopen(
+            "/System/Library/PrivateFrameworks/IconServices.framework/IconServices",
+            RTLD_LAZY | RTLD_LOCAL);
+        if (iconServices) {
+            createIconFromCachedBitmap = (LICreateIconFromCachedBitmapFn)dlsym(
+                iconServices, "LICreateIconFromCachedBitmap");
+        }
+    });
+
+    if (!createIconFromCachedBitmap) return nil;
+    CGImageRef imageRef = createIconFromCachedBitmap(data);
+    if (!imageRef) return nil;
+    UIImage *image = [UIImage imageWithCGImage:imageRef];
+    CGImageRelease(imageRef);
+    return image ? UIImagePNGRepresentation(image) : nil;
+}
+
+static NSArray<NSDictionary *> *TDListInstalledUserAppsIncludingIcons(BOOL includeIcons) {
     NSMutableArray *apps = [NSMutableArray array];
+    NSUInteger iconCount = 0;
     NSArray<LSApplicationProxy *> *installed =
         [[LSApplicationWorkspace defaultWorkspace] atl_allInstalledApplications];
     for (LSApplicationProxy *proxy in installed) {
@@ -112,13 +217,47 @@ NSArray<NSDictionary *> *TDListInstalledUserApps(void) {
         NSString *name = [proxy atl_nameToDisplay];
         NSString *ver = [proxy atl_shortVersionString];
         if (!bid || !name) continue;
-        [apps addObject:@{@"bundleID": bid, @"name": name, @"version": ver ?: @""}];
+        NSMutableDictionary *app = [@{@"bundleID": bid, @"name": name, @"version": ver ?: @""} mutableCopy];
+        if (includeIcons) {
+            NSData *rawIconData = [proxy atl_primaryIconData];
+            NSData *iconData = TDNormalizeIconData(rawIconData);
+            if (!iconData) {
+                rawIconData = [proxy atl_iconData];
+                iconData = TDNormalizeIconData(rawIconData);
+            }
+            if (iconData) {
+                app[@"iconData"] = [iconData base64EncodedStringWithOptions:0];
+                app[@"iconFormat"] = @"png";
+                iconCount++;
+            } else {
+                TDVLog(@"No usable icon for %@ (icon selectors: %@, primary selectors: %@; raw bytes: %lu)",
+                       bid,
+                       [proxy respondsToSelector:NSSelectorFromString(@"iconDataForVariant:")] ||
+                           [proxy respondsToSelector:NSSelectorFromString(@"iconDataForVariant:withOptions:")] ? @"available" : @"unavailable",
+                       [proxy respondsToSelector:NSSelectorFromString(@"primaryIconDataForVariant:")] ||
+                           [proxy respondsToSelector:NSSelectorFromString(@"primaryIconDataForVariant:withOptions:")] ? @"available" : @"unavailable",
+                       (unsigned long)rawIconData.length);
+            }
+        }
+        [apps addObject:app];
     }
     NSSortDescriptor *s = [NSSortDescriptor sortDescriptorWithKey:@"name"
                                                         ascending:YES
                                                          selector:@selector(localizedCaseInsensitiveCompare:)];
     [apps sortUsingDescriptors:@[s]];
+    if (includeIcons) {
+        TDVLog(@"Listed %lu user apps; normalized %lu icons",
+               (unsigned long)apps.count, (unsigned long)iconCount);
+    }
     return apps;
+}
+
+NSArray<NSDictionary *> *TDListInstalledUserApps(void) {
+    return TDListInstalledUserAppsIncludingIcons(NO);
+}
+
+NSArray<NSDictionary *> *TDListInstalledUserAppsWithIcons(void) {
+    return TDListInstalledUserAppsIncludingIcons(YES);
 }
 
 #pragma mark - Memory read helpers
@@ -233,9 +372,21 @@ static int spawnSuspended(NSString *execPath, pid_t *outPid, task_t *outTask) {
     posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
 
     const char *c_exec = [execPath fileSystemRepresentation];
+
+    struct stat preStat;
+    if (stat(c_exec, &preStat) == 0) {
+        TDVLog(@"spawnSuspended: target=%@ size=%lld mode=0%o uid=%d gid=%d",
+               execPath, (long long)preStat.st_size, preStat.st_mode & 07777,
+               preStat.st_uid, preStat.st_gid);
+    } else {
+        TDVLog(@"spawnSuspended: target=%@ stat() failed: %s", execPath, strerror(errno));
+    }
+    TDVLogMemoryStats([NSString stringWithFormat:@"before spawn %@", execPath.lastPathComponent]);
+
     char *argv[] = { (char *)c_exec, NULL };
     pid_t pid = 0;
     int rc = posix_spawn(&pid, c_exec, &fa, &attr, argv, environ);
+    TDVLog(@"spawnSuspended: first posix_spawn rc=%d (%s)", rc, rc ? strerror(rc) : "ok");
 
     // Installed extension binaries sometimes ship without +x bits (iOS normally
     // launches them via ExtensionKit, which doesn't rely on the exec bit). A
@@ -245,17 +396,23 @@ static int spawnSuspended(NSString *execPath, pid_t *outPid, task_t *outTask) {
         if (stat(c_exec, &st) == 0) {
             mode_t want = st.st_mode | S_IXUSR | S_IXGRP | S_IXOTH;
             if (want != st.st_mode && chmod(c_exec, want) == 0) {
+                TDVLog(@"spawnSuspended: retrying after chmod +x");
                 rc = posix_spawn(&pid, c_exec, &fa, &attr, argv, environ);
+                TDVLog(@"spawnSuspended: retry posix_spawn rc=%d (%s)", rc, rc ? strerror(rc) : "ok");
             }
         }
     }
 
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&attr);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        TDVLogMemoryStats([NSString stringWithFormat:@"after failed spawn %@", execPath.lastPathComponent]);
+        return rc;
+    }
 
     task_t task = MACH_PORT_NULL;
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    TDVLog(@"spawnSuspended: pid=%d task_for_pid kr=%d (%s)", pid, kr, mach_error_string(kr));
     if (kr != KERN_SUCCESS) {
         kill(pid, SIGKILL);
         int status = 0; waitpid(pid, &status, WNOHANG);
@@ -412,8 +569,10 @@ static TDRuntimeScanResult runtimeScanBundle(NSString *bundleDir,
         .error = nil,
     };
     NSString *execPath = [bundleDir stringByAppendingPathComponent:execName];
+    TDVLog(@"runtimeScanBundle: starting %@", execPath);
     if (![[NSFileManager defaultManager] fileExistsAtPath:execPath]) {
         r.error = [NSString stringWithFormat:@"main exec missing: %@", execPath];
+        TDVLog(@"runtimeScanBundle: %@", r.error);
         return r;
     }
 
@@ -423,16 +582,21 @@ static TDRuntimeScanResult runtimeScanBundle(NSString *bundleDir,
     if (rc != 0) {
         r.error = [NSString stringWithFormat:@"posix_spawn(SUSPENDED) %@: %s",
                    execPath, strerror(rc)];
+        TDVLog(@"runtimeScanBundle: %@", r.error);
         return r;
     }
+    TDVLog(@"runtimeScanBundle: spawned pid=%d, locating main exec base ...", pid);
 
     // 1) Read the main exec's Mach-O header before resuming. VM regions are
     //    set up at spawn time, so mach_vm_read against the suspended child
     //    returns whatever the kernel mapped for it — which is enough to
     //    locate and copy the __objc_classname strings.
     mach_vm_address_t mainBase = findMainExecBase(task);
+    TDVLog(@"runtimeScanBundle: mainBase=0x%llx", (unsigned long long)mainBase);
     if (mainBase != 0) {
         NSSet *ns = classNamesForImage(task, mainBase);
+        TDVLog(@"runtimeScanBundle: main exec class scan found %lu classes",
+               (unsigned long)ns.count);
         if (ns) {
             [r.classes unionSet:ns];
             [r.paths addObject:execPath];
@@ -443,12 +607,15 @@ static TDRuntimeScanResult runtimeScanBundle(NSString *bundleDir,
     //    dyld_all_image_infos. We catch any exception (e.g. minos-check
     //    abort on a future-iOS IPA) and re-suspend immediately.
     letDyldMapFrameworks(task);
+    TDVLog(@"runtimeScanBundle: resume/re-suspend window done, walking dyld image list ...");
 
     // 3) Walk dyld_all_image_infos for every image whose path lives inside
     //    the bundle. Adds frameworks + any appex binaries dyld happened to
     //    map (rare — appex mains usually aren't loaded by the host).
     NSSet *byDyld = collectBundleClassNames(task, bundleDir, r.paths);
     if (byDyld) [r.classes unionSet:byDyld];
+    TDVLog(@"runtimeScanBundle: done, total classes=%lu, images scanned=%lu",
+           (unsigned long)r.classes.count, (unsigned long)r.paths.count);
 
     killTarget(pid, task);
     return r;
@@ -719,9 +886,12 @@ static TDPrivacyScanResult collectPrivacyManifests(NSString *bundleDir) {
 
 #pragma mark - Info.plist keys + URL schemes
 
-static NSSet<NSString *> *collectPlistTokens(NSString *bundleDir) {
+static NSDictionary *loadInfoPlist(NSString *bundleDir) {
     NSString *infoPath = [bundleDir stringByAppendingPathComponent:@"Info.plist"];
-    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+    return [NSDictionary dictionaryWithContentsOfFile:infoPath];
+}
+
+static NSSet<NSString *> *collectPlistTokens(NSDictionary *info) {
     if (!info) return [NSSet set];
     NSMutableSet *tokens = [NSMutableSet setWithArray:[info allKeys]];
     NSArray *urlTypes = info[@"CFBundleURLTypes"];
@@ -739,18 +909,175 @@ static NSSet<NSString *> *collectPlistTokens(NSString *bundleDir) {
     return tokens;
 }
 
-#pragma mark - Public entry point
+// Same protected-resource usage-description keys AppMonitor's Frida script
+// (frida_permissions.js) reads via NSBundle.mainBundle().infoDictionary() at
+// runtime. Since that script never hooks anything live, the same result
+// comes straight out of the static Info.plist we already have on disk.
+static NSArray<NSString *> *protectedResourceKeys(void) {
+    return @[
+        @"NSBluetoothAlwaysUsageDescription",
+        @"NSCalendarsUsageDescription",
+        @"NSRemindersUsageDescription",
+        @"NSCameraUsageDescription",
+        @"NSMicrophoneUsageDescription",
+        @"NSContactsUsageDescription",
+        @"NSFaceIDUsageDescription",
+        @"NSDesktopFolderUsageDescription",
+        @"NSDocumentsFolderUsageDescription",
+        @"NSDownloadsFolderUsageDescription",
+        @"NSNetworkVolumesUsageDescription",
+        @"NSRemovableVolumesUsageDescription",
+        @"NSFileProviderDomainUsageDescription",
+        @"NSGKFriendListUsageDescription",
+        @"NSHealthClinicalHealthRecordsShareUsageDescription",
+        @"NSHealthShareUsageDescription",
+        @"NSHealthUpdateUsageDescription",
+        @"NSHealthRequiredReadAuthorizationTypeIdentifiers",
+        @"NSHomeKitUsageDescription",
+        @"NSLocationAlwaysAndWhenInUseUsageDescription",
+        @"NSLocationUsageDescription",
+        @"NSLocationWhenInUseUsageDescription",
+        @"NSLocationTemporaryUsageDescriptionDictionary",
+        @"NSWidgetWantsLocation",
+        @"NSLocationDefaultAccuracyReduced",
+        @"NSAppleMusicUsageDescription",
+        @"NSMotionUsageDescription",
+        @"NSFallDetectionUsageDescription",
+        @"NSLocalNetworkUsageDescription",
+        @"NSNearbyInteractionUsageDescription",
+        @"NFCReaderUsageDescription",
+        @"NSPhotoLibraryAddUsageDescription",
+        @"NSPhotoLibraryUsageDescription",
+        @"NSUpdateSecurityPolicy",
+        @"NSUserTrackingUsageDescription",
+        @"NSAppleEventsUsageDescription",
+        @"NSSensorKitUsageDescription",
+        @"NSSensorKitUsageDetail",
+        @"NSSensorKitPrivacyPolicyURL",
+        @"NSSiriUsageDescription",
+        @"NSSpeechRecognitionUsageDescription",
+        @"NSVideoSubscriberAccountUsageDescription",
+        @"NSIdentityUsageDescription",
+    ];
+}
 
-NSDictionary *TDScanBundleID(NSString *bundleID, NSArray *sigs, NSError **err) {
+// Mirrors Frida's `.toString()` coercion so string, array, dict and boxed
+// numeric/boolean plist values all come out the same way the old
+// frida_permissions.js payload did.
+static NSString *plistValueToString(id value) {
+    if ([value isKindOfClass:[NSString class]]) return value;
+    if ([value isKindOfClass:[NSNumber class]]) return [value stringValue];
+    return [value description];
+}
+
+// Equivalent of AppMonitor's AnalyseFridaPermissions: which protected-resource
+// usage-description keys this app declares, and the developer-supplied text
+// for each. Purely static — the app is never executed.
+static NSDictionary<NSString *, NSString *> *collectDeclaredPermissions(NSDictionary *info) {
+    if (!info) return @{};
+    NSMutableDictionary *found = [NSMutableDictionary dictionary];
+    for (NSString *key in protectedResourceKeys()) {
+        id value = info[key];
+        if (value == nil) continue;
+        found[key] = plistValueToString(value);
+    }
+    return found;
+}
+
+// Mirrors frida_get_bundledata.js's recursive toJSON(): strings pass through,
+// numbers/booleans stay numbers/booleans, arrays and dictionaries recurse,
+// anything else falls back to -description. Missing values become NSNull so
+// the shape matches Frida's `null` output instead of dropping the key.
+static id plistValueToJSONObject(id value) {
+    if (value == nil) return [NSNull null];
+    if ([value isKindOfClass:[NSString class]]) return value;
+    if ([value isKindOfClass:[NSNumber class]]) {
+        NSString *s = [value stringValue];
+        if ([s isEqualToString:@"0"] || [s isEqualToString:@"1"]) {
+            return @([value boolValue]);
+        }
+        return value;
+    }
+    if ([value isKindOfClass:[NSArray class]]) {
+        NSMutableArray *out = [NSMutableArray arrayWithCapacity:[value count]];
+        for (id item in value) [out addObject:plistValueToJSONObject(item)];
+        return out;
+    }
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:[value count]];
+        for (id key in value) {
+            out[[key description]] = plistValueToJSONObject(value[key]);
+        }
+        return out;
+    }
+    return [value description];
+}
+
+// Equivalent of AppMonitor's GetBundleInformation: the same fixed set of
+// Info.plist keys frida_get_bundledata.js reads via NSBundle.mainBundle()
+// .infoDictionary(), read directly from the on-disk plist instead.
+static NSDictionary<NSString *, id> *collectBundleInformation(NSDictionary *info) {
+    NSDictionary<NSString *, NSString *> *fieldToKey = @{
+        @"displayName":         @"CFBundleDisplayName",
+        @"bundleName":          @"CFBundleName",
+        @"shortVersion":        @"CFBundleShortVersionString",
+        @"buildVersion":        @"CFBundleVersion",
+        @"executable":          @"CFBundleExecutable",
+        @"minimumIOS":          @"MinimumOSVersion",
+        @"supportedPlatforms":  @"CFBundleSupportedPlatforms",
+        @"developmentRegion":   @"CFBundleDevelopmentRegion",
+        @"deviceFamily":        @"UIDeviceFamily",
+        @"urlTypes":            @"CFBundleURLTypes",
+        @"querySchemes":        @"LSApplicationQueriesSchemes",
+        @"backgroundModes":     @"UIBackgroundModes",
+        @"ats":                 @"NSAppTransportSecurity",
+        @"encryption":          @"ITSAppUsesNonExemptEncryption",
+    };
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:fieldToKey.count];
+    for (NSString *field in fieldToKey) {
+        out[field] = plistValueToJSONObject(info[fieldToKey[field]]);
+    }
+    return out;
+}
+
+#pragma mark - Evidence collection (device-side; no signature matching)
+
+// Everything trackerscan can only get by being on the phone: RAM class
+// names, the static disk walk, privacy manifests, and the raw plist. No
+// signature regex matching happens here — that's left to the caller so
+// signature updates never require touching the device.
+typedef struct {
+    NSString                   *bundleID;
+    NSString                   *version;
+    NSMutableSet<NSString *>   *runtimeClasses;  // classes seen in RAM (main exec + appexes)
+    NSMutableSet<NSString *>   *staticClasses;   // classes seen via static disk walk only
+    NSMutableSet<NSString *>   *frameworkNames;  // "FBSDKCoreKit", ... (for dylib-name matching)
+    NSSet<NSString *>          *plistTokens;     // Info.plist keys + URL schemes (for plist matching)
+    NSDictionary               *permissions;     // NS*UsageDescription -> developer text
+    NSDictionary               *bundleInfo;      // CFBundle* metadata fields
+    NSArray<NSString *>        *trackingDomains;
+    NSUInteger                  privacyManifests;
+    BOOL                        privacyTracking;
+    NSUInteger                  scannedImages;
+    NSUInteger                  candidateImages;
+    NSUInteger                  appexCount;
+    NSUInteger                  appexScanned;
+    NSUInteger                  encryptedBinaries;
+    NSString                   *runtimeError;    // nil if fully successful
+} TDEvidence;
+
+static BOOL collectEvidence(NSString *bundleID, TDEvidence *out, NSError **err) {
     LSApplicationProxy *proxy = [LSApplicationProxy applicationProxyForIdentifier:bundleID];
     if (!proxy || !proxy.canonicalExecutablePath) {
         if (err) *err = tderr(TDScannerErrorUnknownBundleID, @"unknown bundleID: %@", bundleID);
-        return nil;
+        return NO;
     }
     NSString *exe = proxy.canonicalExecutablePath;
     NSString *execName = [exe lastPathComponent];
     NSString *bundleDir = [exe stringByDeletingLastPathComponent];
     NSString *version = [proxy atl_shortVersionString] ?: @"";
+    TDVLog(@"collectEvidence: bundleID=%@ version=%@ bundleDir=%@ execName=%@",
+           bundleID, version, bundleDir, execName);
 
     // 1) Runtime pass: spawn-suspend main exec + mach_vm_read.
     TDRuntimeScanResult rt = runtimeScanBundle(bundleDir, execName);
@@ -779,14 +1106,23 @@ NSDictionary *TDScanBundleID(NSString *bundleID, NSArray *sigs, NSError **err) {
                 NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
                                        [appexDir stringByAppendingPathComponent:@"Info.plist"]];
                 NSString *appexExec = info[@"CFBundleExecutable"];
-                if (!appexExec.length) continue;
+                if (!appexExec.length) {
+                    TDVLog(@"collectEvidence: appex %@ has no CFBundleExecutable, skipping runtime pass", entry);
+                    continue;
+                }
                 TDRuntimeScanResult ar = runtimeScanBundle(appexDir, appexExec);
-                if (!ar.error) appexScanned++;
+                if (!ar.error) {
+                    appexScanned++;
+                } else {
+                    TDVLog(@"collectEvidence: appex %@ runtime scan failed: %@", entry, ar.error);
+                }
                 [appexClasses unionSet:ar.classes];
                 [appexPaths addObjectsFromArray:ar.paths];
             }
         }
     }
+    TDVLog(@"collectEvidence: appexCount=%lu appexScanned=%lu",
+           (unsigned long)appexCount, (unsigned long)appexScanned);
 
     NSMutableSet<NSString *> *runtimeClasses = [NSMutableSet setWithSet:rt.classes];
     [runtimeClasses unionSet:appexClasses];
@@ -803,10 +1139,86 @@ NSDictionary *TDScanBundleID(NSString *bundleID, NSArray *sigs, NSError **err) {
     }
     TDBundleWalkResult st = bundleStaticWalk(bundleDir, runtimePathSet);
     TDPrivacyScanResult pr = collectPrivacyManifests(bundleDir);
-    NSSet<NSString *> *plistTokens = collectPlistTokens(bundleDir);
+    NSDictionary *info = loadInfoPlist(bundleDir);
+    NSSet<NSString *> *plistTokens = collectPlistTokens(info);
+    NSDictionary<NSString *, NSString *> *permissions = collectDeclaredPermissions(info);
+    NSDictionary<NSString *, id> *bundleInfo = collectBundleInformation(info);
 
-    NSMutableSet *allClasses = [NSMutableSet setWithSet:runtimeClasses];
-    [allClasses unionSet:st.classes];
+    NSArray *trackingDomains = [[pr.trackingDomains allObjects]
+                                 sortedArrayUsingSelector:@selector(compare:)];
+
+    out->bundleID = bundleID;
+    out->version = version;
+    out->runtimeClasses = runtimeClasses;
+    out->staticClasses = st.classes;
+    out->frameworkNames = st.frameworkNames;
+    out->plistTokens = plistTokens;
+    out->permissions = permissions;
+    out->bundleInfo = bundleInfo;
+    out->trackingDomains = trackingDomains;
+    out->privacyManifests = pr.manifestCount;
+    out->privacyTracking = pr.anyTracking;
+    out->scannedImages = allRuntimePaths.count;
+    out->candidateImages = st.paths.count;
+    out->appexCount = appexCount;
+    out->appexScanned = appexScanned;
+    out->encryptedBinaries = st.encryptedBinaries;
+    out->runtimeError = runtimeError;
+    return YES;
+}
+
+#pragma mark - Public entry point
+
+NSDictionary *TDDumpBundleID(NSString *bundleID, NSError **err) {
+    TDEvidence ev = {0};
+    if (!collectEvidence(bundleID, &ev, err)) return nil;
+
+    NSMutableArray *classes = [NSMutableArray array];
+    NSMutableSet *allClasses = [NSMutableSet setWithSet:ev.runtimeClasses];
+    [allClasses unionSet:ev.staticClasses];
+    for (NSString *cn in allClasses) {
+        BOOL inRuntime = [ev.runtimeClasses containsObject:cn];
+        BOOL inStatic = [ev.staticClasses containsObject:cn];
+        NSString *source = (inRuntime && inStatic) ? @"both" : (inRuntime ? @"runtime" : @"static");
+        [classes addObject:@{@"name": cn, @"source": source}];
+    }
+    [classes sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"name"] compare:b[@"name"]];
+    }];
+
+    NSArray *frameworkNames = [[ev.frameworkNames allObjects]
+                                sortedArrayUsingSelector:@selector(compare:)];
+    NSArray *plistTokens = [[ev.plistTokens allObjects]
+                             sortedArrayUsingSelector:@selector(compare:)];
+
+    NSMutableDictionary *out = [@{
+        @"bundleID": ev.bundleID,
+        @"version": ev.version,
+        @"scannedImages": @(ev.scannedImages),
+        @"candidateImages": @(ev.candidateImages),
+        @"appexCount": @(ev.appexCount),
+        @"appexScanned": @(ev.appexScanned),
+        @"classCount": @(allClasses.count),
+        @"privacyManifests": @(ev.privacyManifests),
+        @"privacyTracking": @(ev.privacyTracking),
+        @"trackingDomains": ev.trackingDomains,
+        @"classes": classes,
+        @"frameworkNames": frameworkNames,
+        @"plistTokens": plistTokens,
+        @"permissions": ev.permissions,
+        @"bundleInfo": ev.bundleInfo,
+    } mutableCopy];
+    if (ev.runtimeError) out[@"runtimeError"] = ev.runtimeError;
+    if (ev.encryptedBinaries) out[@"encryptedBinaries"] = @(ev.encryptedBinaries);
+    return out;
+}
+
+NSDictionary *TDScanBundleID(NSString *bundleID, NSArray *sigs, NSError **err) {
+    TDEvidence ev = {0};
+    if (!collectEvidence(bundleID, &ev, err)) return nil;
+
+    NSMutableSet *allClasses = [NSMutableSet setWithSet:ev.runtimeClasses];
+    [allClasses unionSet:ev.staticClasses];
 
     NSMutableDictionary *byID = [NSMutableDictionary dictionary];
 
@@ -827,8 +1239,8 @@ NSDictionary *TDScanBundleID(NSString *bundleID, NSArray *sigs, NSError **err) {
 
     for (NSString *cn in allClasses) {
         NSRange whole = NSMakeRange(0, cn.length);
-        BOOL inRuntime = [runtimeClasses containsObject:cn];
-        BOOL inStatic = [st.classes containsObject:cn];
+        BOOL inRuntime = [ev.runtimeClasses containsObject:cn];
+        BOOL inStatic = [ev.staticClasses containsObject:cn];
         NSString *source = (inRuntime && inStatic) ? @"both" : (inRuntime ? @"runtime" : @"static");
         for (NSDictionary *sig in sigs) {
             NSRegularExpression *re = sig[@"regex"];
@@ -841,7 +1253,7 @@ NSDictionary *TDScanBundleID(NSString *bundleID, NSArray *sigs, NSError **err) {
         }
     }
 
-    for (NSString *fwName in st.frameworkNames) {
+    for (NSString *fwName in ev.frameworkNames) {
         NSRange whole = NSMakeRange(0, fwName.length);
         for (NSDictionary *sig in sigs) {
             NSRegularExpression *re = sig[@"dylibRegex"];
@@ -852,7 +1264,7 @@ NSDictionary *TDScanBundleID(NSString *bundleID, NSArray *sigs, NSError **err) {
         }
     }
 
-    for (NSString *tok in plistTokens) {
+    for (NSString *tok in ev.plistTokens) {
         NSRange whole = NSMakeRange(0, tok.length);
         for (NSDictionary *sig in sigs) {
             NSRegularExpression *re = sig[@"plistRegex"];
@@ -872,28 +1284,27 @@ NSDictionary *TDScanBundleID(NSString *bundleID, NSArray *sigs, NSError **err) {
         m[@"sources"] = srcs;
     }
 
-    NSArray *trackingDomains = [[pr.trackingDomains allObjects]
-                                 sortedArrayUsingSelector:@selector(compare:)];
-
     NSMutableDictionary *out = [@{
-        @"bundleID": bundleID,
-        @"version": version,
-        @"scannedImages": @(allRuntimePaths.count),
-        @"candidateImages": @(st.paths.count),
-        @"appexCount": @(appexCount),
-        @"appexScanned": @(appexScanned),
+        @"bundleID": ev.bundleID,
+        @"version": ev.version,
+        @"scannedImages": @(ev.scannedImages),
+        @"candidateImages": @(ev.candidateImages),
+        @"appexCount": @(ev.appexCount),
+        @"appexScanned": @(ev.appexScanned),
         @"classCount": @(allClasses.count),
-        @"privacyManifests": @(pr.manifestCount),
-        @"privacyTracking": @(pr.anyTracking),
-        @"trackingDomains": trackingDomains,
+        @"privacyManifests": @(ev.privacyManifests),
+        @"privacyTracking": @(ev.privacyTracking),
+        @"trackingDomains": ev.trackingDomains,
         @"matches": matches,
+        @"permissions": ev.permissions,
+        @"bundleInfo": ev.bundleInfo,
     } mutableCopy];
-    if (runtimeError) out[@"runtimeError"] = runtimeError;
+    if (ev.runtimeError) out[@"runtimeError"] = ev.runtimeError;
     // `encryptedBinaries` counts Mach-Os whose __objc_classname the RAM pass
     // also didn't reach (e.g. a framework dyld never dlopen'd during the
     // brief resume window). The main exec and successfully-spawned appex
     // mains don't contribute: the RAM pass already produced class names
     // for those.
-    if (st.encryptedBinaries) out[@"encryptedBinaries"] = @(st.encryptedBinaries);
+    if (ev.encryptedBinaries) out[@"encryptedBinaries"] = @(ev.encryptedBinaries);
     return out;
 }

@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <objc/message.h>
 #import "LSApplicationProxy+AltList.h"
 
 @implementation LSApplicationProxy (AltList)
@@ -155,6 +156,41 @@ BOOL tagArrayContainsTag(NSArray* tagArr, NSString* tag)
     }
 
     return version;
+}
+
+- (NSData *)atl_iconDataForSelector:(SEL)selector withOptions:(BOOL)withOptions {
+	if (![self respondsToSelector:selector]) return nil;
+
+	// LaunchServices icon variants are private and vary across iOS versions.
+	const int variants[] = {0x20, 1, 2, 0, 4, 6, 3, 5, 7, 15};
+	id (*sendIconRequest)(id, SEL, int) = (id (*)(id, SEL, int))objc_msgSend;
+	id (*sendIconRequestWithOptions)(id, SEL, int, int) =
+		(id (*)(id, SEL, int, int))objc_msgSend;
+	for (NSUInteger index = 0; index < sizeof(variants) / sizeof(variants[0]); index++) {
+		id result = withOptions
+			? sendIconRequestWithOptions(self, selector, variants[index], 0)
+			: sendIconRequest(self, selector, variants[index]);
+		if ([result isKindOfClass:[NSData class]] && [result length] > 0) {
+			return result;
+		}
+	}
+	return nil;
+}
+
+- (NSData *)atl_iconData {
+	NSData *data = [self atl_iconDataForSelector:NSSelectorFromString(@"iconDataForVariant:")
+									withOptions:NO];
+	if (data) return data;
+	return [self atl_iconDataForSelector:NSSelectorFromString(@"iconDataForVariant:withOptions:")
+								withOptions:YES];
+}
+
+- (NSData *)atl_primaryIconData {
+	NSData *data = [self atl_iconDataForSelector:NSSelectorFromString(@"primaryIconDataForVariant:")
+									withOptions:NO];
+	if (data) return data;
+	return [self atl_iconDataForSelector:NSSelectorFromString(@"primaryIconDataForVariant:withOptions:")
+								withOptions:YES];
 }
 
 @end

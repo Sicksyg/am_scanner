@@ -1,5 +1,5 @@
-Package: com.trackerscan.cli
-Name: trackerscan
+Package: com.sicksyg.am-scanner
+Name: am_scanner
 Version: 0.1.0
 Architecture: iphoneos-arm
 Description: On-device detector for iOS tracking libraries. Reads

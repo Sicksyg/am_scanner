@@ -23,12 +23,15 @@
 @end
 
 @interface LSApplicationProxy (AltList)
+- (NSData*)atl_iconDataForSelector:(SEL)selector withOptions:(BOOL)withOptions;
 - (BOOL)atl_isSystemApplication;
 - (BOOL)atl_isUserApplication;
 - (BOOL)atl_isHidden;
 - (NSString*)atl_fastDisplayName;
 - (NSString*)atl_nameToDisplay;
 - (NSString*)atl_shortVersionString;
+- (NSData*)atl_iconData;
+- (NSData*)atl_primaryIconData;
 @property (nonatomic,readonly) NSString* atl_bundleIdentifier;
 @end
 
