@@ -8,27 +8,71 @@ evidence against a bundled signature list.
 This repo is forked from [TrackerControl/trackerscan-ios](https://github.com/TrackerControl/trackerscan-ios)
 It adheers to the same license from [TrackerControl/tracker-control-ios](https://github.com/TrackerControl/tracker-control-ios): [LICENSE](https://github.com/TrackerControl/tracker-control-ios/blob/main/LICENSE)
 
-## Build
+## Install
 
-Requires [Theos](https://theos.dev) with a rootless toolchain:
+Pick the path that fits you. All produce the same package,
+`am_scanner_<version>_iphoneos-arm64.deb` (Debian package id `am-scanner`,
+rootless jailbreaks only).
+
+### 1. Install a release (no tools needed)
+
+Download the `.deb` and `SHA256SUMS` from the
+[GitHub releases](https://github.com/Sicksyg/am_scanner/releases), verify, and
+install on the device (or open the `.deb` in Sileo/Zebra):
 
 ```sh
-make package
-# → packages/com.sicksyg.am-scanner_*.deb
+shasum -a 256 -c SHA256SUMS
+dpkg -i am_scanner_*_iphoneos-arm64.deb     # on the device, as root
 ```
+
+Or push it over USB SSH with `scripts/deploy.sh --deb <file>` (see below).
+
+### 2. Build from source
+
+Requires [Theos](https://theos.dev/docs/installation) (`THEOS` defaults to
+`~/theos`) with an iOS 15+ SDK:
+
+```sh
+scripts/build.sh                 # → dist/am_scanner_<version>_iphoneos-arm64.deb
+scripts/deploy.sh --build        # build, then install over USB SSH
+```
+
+### 3. Maintainers: build a GitHub release
+
+```sh
+scripts/build.sh --release       # clean tree only; checksum written
+# → dist/am_scanner_<version>_iphoneos-arm64.deb and dist/SHA256SUMS
+```
+
+Release checklist: bump `Version` in `control`, commit, tag
+(`git tag v<version>`), run the release build, test it on a device, then upload
+both files from `dist/` to the GitHub release for that tag (for example with
+`gh release create v<version> dist/*`).
+
+The binary is signed with powerful entitlements (`task_for_pid-allow`,
+no-sandbox, etc., see `src/entitlements.plist`), so only publish builds you
+produced yourself from a tagged commit, and always publish the checksum.
 
 The package installs the executable at `/var/jb/usr/local/bin/am_scanner`
 and signatures at `/var/jb/usr/share/am_scanner/signatures.json`.
 
+| Script | Purpose |
+| --- | --- |
+| `scripts/build.sh [--release]` | Build the `.deb` into `dist/` (never touches a device) |
+| `scripts/deploy.sh [--build] [--deb <file>] [--run <id>]` | Install a `.deb` on the device over USB SSH (never builds unless `--build`) |
+
 ## Deploy over USB SSH
 
-The deploy script includes its own `scripts/ios-ssh.sh` helper, so AppMonitor
+`scripts/deploy.sh` installs the newest `dist/am_scanner_*.deb` (or the file
+given with `--deb`) and verifies it against an adjacent `SHA256SUMS` if
+present. It includes its own `scripts/ios-ssh.sh` helper, so AppMonitor
 does not need to be installed first. The helper starts or reuses `iproxy` and
 connects using an SSH host alias (default: `ios`):
 
 ```sh
 scripts/deploy.sh
-scripts/deploy.sh --run com.example.app
+scripts/deploy.sh --build --run com.example.app
+scripts/deploy.sh --deb ~/Downloads/am_scanner_0.1.0_iphoneos-arm64.deb
 ```
 
 Configure that alias in `~/.ssh/config` to point to the phone's SSH service
@@ -56,9 +100,8 @@ command -v iproxy
 The deploy helper looks for `iproxy` on `PATH`; if it is installed elsewhere,
 set `AM_SCANNER_IPROXY_PATH` to the full executable path.
 
-Use `AM_SCANNER_IOS_SSH_HOST` to select a different SSH alias,
-`AM_SCANNER_IOS_SSH_SCRIPT` to use another helper, or `--no-build` to reuse
-the newest package in `packages/`.
+Use `AM_SCANNER_IOS_SSH_HOST` to select a different SSH alias or
+`AM_SCANNER_IOS_SSH_SCRIPT` to use another helper.
 
 ## Usage
 

@@ -9,3 +9,4 @@ Payload/
 *.ipa
 .cache/
 compile_commands.json
+dist/

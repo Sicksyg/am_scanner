@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 #
-# Build am_scanner with Theos and deploy it over USB SSH.
+# Install an am_scanner .deb on a jailbroken iPhone over USB SSH.
 #
 # Usage:
-#   scripts/deploy.sh [--no-build] [--run <bundleID>]
+#   scripts/deploy.sh [--build] [--deb <file>] [--run <bundleID>]
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DO_BUILD=1
+DO_BUILD=0
+DEB_PATH=""
 RUN_BUNDLE_ID=""
 IOS_SSH_SCRIPT="${AM_SCANNER_IOS_SSH_SCRIPT:-$SCRIPT_DIR/ios-ssh.sh}"
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--no-build] [--run <bundleID>]
+Usage: $(basename "$0") [--build] [--deb <file>] [--run <bundleID>]
 
-  --no-build       skip 'make package' and use the newest existing .deb
+  --build          run scripts/build.sh first (build from source and install)
+  --deb <file>     install this package (e.g. a downloaded release);
+                   default: newest dist/am_scanner_*.deb
   --run <bundleID> run am_scanner for the bundle after installation
   --help           show this help
 
@@ -37,9 +40,17 @@ shell_quote() {
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --no-build)
-            DO_BUILD=0
+        --build)
+            DO_BUILD=1
             shift
+            ;;
+        --deb)
+            if [ "$#" -lt 2 ]; then
+                echo "error: --deb requires a file" >&2
+                exit 2
+            fi
+            DEB_PATH="$(cd "$(dirname "$2")" 2>/dev/null && pwd)/$(basename "$2")"
+            shift 2
             ;;
         --run)
             if [ "$#" -lt 2 ]; then
@@ -84,27 +95,24 @@ fi
 cd "$REPO_ROOT"
 
 if [ "$DO_BUILD" -eq 1 ]; then
-    if [ -z "${THEOS:-}" ]; then
-        export THEOS="$HOME/theos"
-    fi
-    if [ ! -f "$THEOS/makefiles/common.mk" ]; then
-        echo "error: Theos not found at THEOS=$THEOS (missing makefiles/common.mk)" >&2
-        exit 1
-    fi
-    echo "==> Building package (THEOS=$THEOS)"
-    make package
+    "$SCRIPT_DIR/build.sh"
 fi
 
-DEB_PATH=""
-for package in packages/com.sicksyg.am-scanner_*.deb; do
-    [ -f "$package" ] || continue
-    if [ -z "$DEB_PATH" ] || [ "$package" -nt "$DEB_PATH" ]; then
-        DEB_PATH="$package"
-    fi
-done
 if [ -z "$DEB_PATH" ]; then
-    echo "error: no am_scanner .deb found under packages/" >&2
+    for package in dist/am_scanner_*.deb; do
+        [ -f "$package" ] || continue
+        if [ -z "$DEB_PATH" ] || [ "$package" -nt "$DEB_PATH" ]; then
+            DEB_PATH="$package"
+        fi
+    done
+fi
+if [ -z "$DEB_PATH" ] || [ ! -f "$DEB_PATH" ]; then
+    echo "error: no .deb found; run scripts/build.sh, use --build, or pass --deb <file>" >&2
     exit 1
+fi
+if [ -f "$(dirname "$DEB_PATH")/SHA256SUMS" ]; then
+    echo "==> Verifying checksum"
+    (cd "$(dirname "$DEB_PATH")" && shasum -a 256 -c SHA256SUMS --ignore-missing)
 fi
 echo "==> Using package: $DEB_PATH"
 

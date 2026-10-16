@@ -1,4 +1,4 @@
-Package: com.sicksyg.am-scanner
+Package: am-scanner
 Name: am_scanner
 Version: 0.1.0
 Architecture: iphoneos-arm
@@ -7,7 +7,4 @@ Description: On-device detector for iOS tracking libraries. Reads
  legitimately-installed apps and matches them against a bundled
  signature list. Writes no files and does not decrypt or reproduce
  app binaries.
-Depends: firmware (>= 15.0)
-Maintainer: hello@trackercontrol.org
-Author: hello@trackercontrol.org
 Section: Security
