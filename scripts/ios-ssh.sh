@@ -1,11 +1,12 @@
 #!/bin/bash
-# Connect to a jailbroken iPhone over USB using iproxy and the configured SSH
-# host alias. The alias defaults to "ios"; see the am_scanner README.
+# Connect to a jailbroken iPhone over USB using iproxy and SSH.
+# No ~/.ssh/config needed: by default it connects as mobile@127.0.0.1 through
+# the USB tunnel. Set AM_SCANNER_IOS_SSH_HOST to use your own SSH host alias.
 set -euo pipefail
 
 LOCAL_PORT="${AM_SCANNER_IOS_SSH_LOCAL_PORT:-2222}"
 REMOTE_PORT="${AM_SCANNER_IOS_SSH_REMOTE_PORT:-22}"
-SSH_HOST="${AM_SCANNER_IOS_SSH_HOST:-ios}"
+SSH_HOST="${AM_SCANNER_IOS_SSH_HOST:-}"
 PIDFILE="${AM_SCANNER_IOS_SSH_PIDFILE:-/tmp/.ios-ssh-iproxy.pid}"
 LOGFILE="${AM_SCANNER_IOS_SSH_LOGFILE:-/tmp/.ios-ssh-iproxy.log}"
 IPROXY="${AM_SCANNER_IPROXY_PATH:-${APPMONITOR_IPROXY_PATH:-iproxy}}"
@@ -53,6 +54,21 @@ fi
 CONTROL_PATH="${AM_SCANNER_IOS_SSH_CONTROL_PATH:-${APPMONITOR_IOS_SSH_CONTROL_PATH:-}}"
 IDENTITY_FILE="${AM_SCANNER_IOS_SSH_IDENTITY_FILE:-${APPMONITOR_IOS_SSH_IDENTITY_FILE:-}}"
 SSH_OPTIONS=()
+if [ -z "$SSH_HOST" ]; then
+    # Traffic stays on the USB cable, and different phones share 127.0.0.1,
+    # so host keys are not recorded. One connection is reused so the password
+    # is only asked once.
+    SSH_HOST="${AM_SCANNER_IOS_SSH_USER:-mobile}@127.0.0.1"
+    SSH_OPTIONS+=(
+        -p "$LOCAL_PORT"
+        -o "StrictHostKeyChecking=no"
+        -o "UserKnownHostsFile=/dev/null"
+        -o "LogLevel=ERROR"
+        -o "ControlMaster=auto"
+        -o "ControlPath=/tmp/.am_scanner-ssh-%C"
+        -o "ControlPersist=120"
+    )
+fi
 if [ -n "$CONTROL_PATH" ]; then
     SSH_OPTIONS+=(-o "ControlPath=$CONTROL_PATH")
 fi

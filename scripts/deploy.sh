@@ -24,11 +24,10 @@ Usage: $(basename "$0") [--build] [--deb <file>] [--run <bundleID>]
   --run <bundleID> run am_scanner for the bundle after installation
   --help           show this help
 
-The bundled ios-ssh.sh uses the configured SSH host alias (default: ios) and
-starts or reuses iproxy:
-  $IOS_SSH_SCRIPT
-Override the helper path with AM_SCANNER_IOS_SSH_SCRIPT, the alias with
-AM_SCANNER_IOS_SSH_HOST, or the iproxy executable with AM_SCANNER_IPROXY_PATH.
+ios-ssh.sh connects as mobile@127.0.0.1 through an iproxy USB tunnel; no SSH
+config is needed. See the README ("Deploy to your iPhone") for setup and for the
+AM_SCANNER_IOS_SSH_USER / _HOST / _LOCAL_PORT and AM_SCANNER_IPROXY_PATH
+overrides.
 EOF
 }
 

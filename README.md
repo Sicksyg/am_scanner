@@ -25,7 +25,7 @@ shasum -a 256 -c SHA256SUMS
 dpkg -i am_scanner_*_iphoneos-arm64.deb     # on the device, as root
 ```
 
-Or push it over USB SSH with `scripts/deploy.sh --deb <file>` (see below).
+Or install it from your Mac over USB with `scripts/deploy.sh --deb <file>` (see [Deploy to your iPhone](#deploy-to-your-iphone)).
 
 ### 2. Build from source
 
@@ -34,7 +34,7 @@ Requires [Theos](https://theos.dev/docs/installation) (`THEOS` defaults to
 
 ```sh
 scripts/build.sh                 # → dist/am_scanner_<version>_iphoneos-arm64.deb
-scripts/deploy.sh --build        # build, then install over USB SSH
+scripts/deploy.sh --build        # build, then install on your iPhone over USB
 ```
 
 ### 3. Maintainers: build a GitHub release
@@ -61,47 +61,34 @@ and signatures at `/var/jb/usr/share/am_scanner/signatures.json`.
 | `scripts/build.sh [--release]` | Build the `.deb` into `dist/` (never touches a device) |
 | `scripts/deploy.sh [--build] [--deb <file>] [--run <id>]` | Install a `.deb` on the device over USB SSH (never builds unless `--build`) |
 
-## Deploy over USB SSH
+## Deploy to your iPhone
 
-`scripts/deploy.sh` installs the newest `dist/am_scanner_*.deb` (or the file
-given with `--deb`) and verifies it against an adjacent `SHA256SUMS` if
-present. It includes its own `scripts/ios-ssh.sh` helper, so AppMonitor
-does not need to be installed first. The helper starts or reuses `iproxy` and
-connects using an SSH host alias (default: `ios`):
+`scripts/deploy.sh` copies the package to your phone over the USB cable and
+installs it. No SSH configuration is needed.
 
+**One-time setup**
+1. On the iPhone (rootless jailbreak), install **OpenSSH** from Sileo/Zebra.
+2. On the Mac, install the USB tunnel tool: `brew install libusbmuxd`
+3. Plug in the iPhone, unlock it and tap **Trust** if asked.
+
+**Deploy**
 ```sh
-scripts/deploy.sh
-scripts/deploy.sh --build --run com.example.app
+scripts/deploy.sh --build                      # build from source and install
 scripts/deploy.sh --deb ~/Downloads/am_scanner_0.1.0_iphoneos-arm64.deb
+scripts/deploy.sh --build --run com.example.app    # also scan an app after install
 ```
 
-Configure that alias in `~/.ssh/config` to point to the phone's SSH service
-through `127.0.0.1:2222`, with the appropriate username and authentication.
-For example:
+You will be asked for the phone's password for the `mobile` user (the
+jailbreak default is `alpine`) once; it is also used for `sudo` during install.
 
-```sshconfig
-Host ios
-    HostName 127.0.0.1
-    Port 2222
-    User mobile
-    IdentityFile ~/.ssh/id_ed25519
-    IdentitiesOnly yes
-```
-
-Use the identity and username configured for your device. The first SSH
-connection must verify and accept the phone's host key. On macOS, install
-`iproxy` with Homebrew's `libusbmuxd` formula:
-
-```sh
-brew install libusbmuxd
-command -v iproxy
-```
-
-The deploy helper looks for `iproxy` on `PATH`; if it is installed elsewhere,
-set `AM_SCANNER_IPROXY_PATH` to the full executable path.
-
-Use `AM_SCANNER_IOS_SSH_HOST` to select a different SSH alias or
-`AM_SCANNER_IOS_SSH_SCRIPT` to use another helper.
+**Troubleshooting**
+- *"iproxy did not open port"*: reconnect the cable, unlock the phone, make
+  sure `iproxy` is installed (`command -v iproxy`).
+- *"Connection refused"*: OpenSSH is not installed or running on the phone.
+- *Different user, port or your own `~/.ssh/config` alias*: set
+  `AM_SCANNER_IOS_SSH_USER`, `AM_SCANNER_IOS_SSH_LOCAL_PORT`, or
+  `AM_SCANNER_IOS_SSH_HOST=<alias>`. `AM_SCANNER_IPROXY_PATH` points to
+  `iproxy` if it is not on your `PATH`.
 
 ## Usage
 
