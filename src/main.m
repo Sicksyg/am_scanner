@@ -51,7 +51,7 @@ int main(int argc, char *argv[]) {
                 verbose = YES; i++;
             } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
                 usage();
-                return 0;
+                return 0; // explicit help is not an error
             } else if (a[0] == '-') {
                 return usage();
             } else {
@@ -63,7 +63,18 @@ int main(int argc, char *argv[]) {
 
         TDSetVerbose(verbose);
 
-        if (jsonOutput && !list) return usage();
+        if (jsonOutput && !list) {
+            fprintf(stderr, "error: --json is only valid with --list\n");
+            return usage();
+        }
+        if (list && (dump || bundleID)) {
+            fprintf(stderr, "error: --list cannot be combined with --dump or a bundle ID\n");
+            return usage();
+        }
+        if (dump && !bundleID) {
+            fprintf(stderr, "error: --dump requires a bundle ID\n");
+            return usage();
+        }
 
         if (list) {
             if (jsonOutput) {
@@ -81,9 +92,9 @@ int main(int argc, char *argv[]) {
             } else {
                 for (NSDictionary *app in TDListInstalledUserApps()) {
                     printf("%s\t%s\t%s\n",
-                           [app[@"bundleID"] UTF8String],
-                           [app[@"name"] UTF8String],
-                           [app[@"version"] UTF8String]);
+                           [(app[@"bundleID"] ?: @"") UTF8String],
+                           [(app[@"name"] ?: @"") UTF8String],
+                           [(app[@"version"] ?: @"") UTF8String]);
                 }
             }
             return 0;

@@ -6,7 +6,7 @@ It scans Objective-C class names and app metadata, then matches collected
 evidence against a bundled signature list.
 
 This repo is forked from [TrackerControl/trackerscan-ios](https://github.com/TrackerControl/trackerscan-ios)
-It adheers to the same license from [TrackerControl/tracker-control-ios](https://github.com/TrackerControl/tracker-control-ios): [LICENSE](https://github.com/TrackerControl/tracker-control-ios/blob/main/LICENSE)
+It adheres to the same license from [TrackerControl/tracker-control-ios](https://github.com/TrackerControl/tracker-control-ios): [LICENSE](https://github.com/TrackerControl/tracker-control-ios/blob/main/LICENSE)
 
 ## Install
 

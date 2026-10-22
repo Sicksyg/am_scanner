@@ -7,4 +7,8 @@ Description: On-device detector for iOS tracking libraries. Reads
  legitimately-installed apps and matches them against a bundled
  signature list. Writes no files and does not decrypt or reproduce
  app binaries.
+Maintainer: Sicksyg
+Depends: firmware (>= 15.0)
+Conflicts: com.sicksyg.am-scanner
+Replaces: com.sicksyg.am-scanner
 Section: Security

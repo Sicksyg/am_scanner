@@ -21,6 +21,7 @@ Usage: $(basename "$0") [--build] [--deb <file>] [--run <bundleID>]
   --build          run scripts/build.sh first (build from source and install)
   --deb <file>     install this package (e.g. a downloaded release);
                    default: newest dist/am_scanner_*.deb
+                   or packages/*.deb
   --run <bundleID> run am_scanner for the bundle after installation
   --help           show this help
 
@@ -48,7 +49,11 @@ while [ "$#" -gt 0 ]; do
                 echo "error: --deb requires a file" >&2
                 exit 2
             fi
-            DEB_PATH="$(cd "$(dirname "$2")" 2>/dev/null && pwd)/$(basename "$2")"
+            if [ ! -f "$2" ]; then
+                echo "error: package not found: $2" >&2
+                exit 2
+            fi
+            DEB_PATH="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
             shift 2
             ;;
         --run)
@@ -98,7 +103,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
 fi
 
 if [ -z "$DEB_PATH" ]; then
-    for package in dist/am_scanner_*.deb; do
+    for package in dist/am_scanner_*.deb packages/*.deb; do
         [ -f "$package" ] || continue
         if [ -z "$DEB_PATH" ] || [ "$package" -nt "$DEB_PATH" ]; then
             DEB_PATH="$package"
@@ -111,7 +116,10 @@ if [ -z "$DEB_PATH" ] || [ ! -f "$DEB_PATH" ]; then
 fi
 if [ -f "$(dirname "$DEB_PATH")/SHA256SUMS" ]; then
     echo "==> Verifying checksum"
-    (cd "$(dirname "$DEB_PATH")" && shasum -a 256 -c SHA256SUMS --ignore-missing)
+    (cd "$(dirname "$DEB_PATH")" && grep -F "  $(basename "$DEB_PATH")" SHA256SUMS | shasum -a 256 -c -) || {
+        echo "error: checksum failed or $(basename "$DEB_PATH") is not listed in SHA256SUMS" >&2
+        exit 1
+    }
 fi
 echo "==> Using package: $DEB_PATH"
 
@@ -120,7 +128,7 @@ echo "==> Copying package to iPhone over USB SSH"
 "$IOS_SSH_SCRIPT" "cat > '$REMOTE_DEB'" < "$DEB_PATH"
 
 echo "==> Installing package on device"
-APPMONITOR_IOS_SSH_TTY=1 "$IOS_SSH_SCRIPT" "sudo apt-get install -y '$REMOTE_DEB' && rm -f '$REMOTE_DEB'"
+APPMONITOR_IOS_SSH_TTY=1 "$IOS_SSH_SCRIPT" "sudo apt-get install -y '$REMOTE_DEB'; rc=\$?; rm -f '$REMOTE_DEB'; exit \$rc"
 
 REMOTE_LOCATE='
 p=$(command -v am_scanner 2>/dev/null)
