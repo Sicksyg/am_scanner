@@ -68,7 +68,7 @@ fi
 NAME="$(basename "$BUILT")"
 OUT="dist/am_scanner_${NAME#*_}"
 mkdir -p dist
-rm -f dist/*.deb
+rm -f dist/*.deb dist/SHA256SUMS
 cp "$BUILT" "$OUT"
 
 if [ "$RELEASE" -eq 1 ]; then
